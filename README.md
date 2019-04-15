@@ -1,0 +1,2 @@
+# Plan Online Learn Offline
+This is an attempt to implement the algorithm proposed by 2019 ICLR paper Plan Online, Learn Offline: Efficient Learning and Exploration via Model-Based Control (<https://openreview.net/forum?id=Byey7n05FQ>).
