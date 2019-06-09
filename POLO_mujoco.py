@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[94]:
+# In[1]:
 
 
 import gym
@@ -10,7 +10,7 @@ import csv
 import json
 
 
-# In[95]:
+# In[2]:
 
 
 import torch
@@ -18,7 +18,13 @@ import torch.nn as nn
 from scipy.special import softmax
 
 
-# In[96]:
+# In[ ]:
+
+
+RENDER = False
+
+
+# In[3]:
 
 
 class ValueNet(nn.Module):
@@ -37,7 +43,54 @@ class ValueNet(nn.Module):
         return self.model(x)
 
 
-# In[97]:
+# In[4]:
+
+
+class MLP(nn.Module):
+    def __init__(self,
+                 input_dim : int,
+                 hidden : int,
+                 output_dim : int):
+        super().__init__()
+        self.l1 = nn.Linear(input_dim, hidden)
+        self.l2 = nn.Linear(hidden, hidden)
+        self.l3 = nn.Linear(hidden, output_dim)
+        
+        nn.init.xavier_uniform_(self.l1.weight)
+        nn.init.xavier_uniform_(self.l2.weight)
+        nn.init.xavier_uniform_(self.l3.weight)
+        
+    def forward(self, inputs):
+        x = self.l1(inputs)
+        x = nn.functional.tanh(x)
+        x = self.l2(x)
+        x = nn.functional.tanh(x)
+        x = self.l3(x)
+        return x
+
+
+# In[5]:
+
+
+class ModelWithPrior(nn.Module):
+    def __init__(self,
+                 base_model : nn.Module,
+                 prior_model : nn.Module,
+                 prior_scale : float = 1.0):
+        super().__init__()
+        self.base_model = base_model
+        self.prior_model = prior_model
+        self.prior_scale = prior_scale
+        
+    def forward(self, inputs):
+        with torch.no_grad():
+            prior_out = self.prior_model(inputs)
+            prior_out = prior_out.detach()
+        model_out = self.base_model(inputs)
+        return model_out + (self.prior_scale * prior_out)
+
+
+# In[6]:
 
 
 class POLO(object):
@@ -49,6 +102,7 @@ class POLO(object):
         self.memory_size = memory_size
         self.obs_mem = np.zeros((self.memory_size, observation_space))
         self.state_mem = [None for i in range(self.memory_size)]
+        self.targets_mem = np.zeros((self.memory_size, num_nets))
         
         self.num_nets = num_nets
         
@@ -75,6 +129,8 @@ class POLO(object):
         
         self.gamma = gamma
         
+        self.max_reward_for_net = np.full((self.num_nets), '-inf', dtype=np.float)
+        
         self.log_file = log_file
         if log_file is not None:
             self.writer = csv.writer(log_file, delimiter='\t')
@@ -95,20 +151,11 @@ class POLO(object):
         self.optimizers = []
         
         for i in range(self.num_nets):
-            self.value_nets.append(ValueNet(input_dim, hidden, output_dim))
+#             self.value_nets.append(ValueNet(input_dim, hidden, output_dim))
+            self.value_nets.append(ModelWithPrior(MLP(input_dim, hidden, output_dim), 
+                                                  MLP(input_dim, hidden, output_dim)))
             self.loss_funcs.append(nn.MSELoss())
             self.optimizers.append(torch.optim.Adam(self.value_nets[-1].parameters(), lr=0.01))
-              
-    def get_aggregated_value(self, s):
-        values = []
-        for net in self.value_nets:
-            values.append(net(torch.FloatTensor(s)).tolist())
-            
-        values = np.array(values)
-        weights = softmax(values)
-        weighted_values = values * weights
-        
-        return sum(weighted_values)
 
     def _get_reward_from_state(self, s):
         root_z = s[0]
@@ -118,61 +165,90 @@ class POLO(object):
             return 1.0 - (1.1 - root_z)
 
     def learn(self, env):
-        self.x_init = self.env.sim.get_state()
-        
-#         for _ in range(self.gradient_steps):
-        sampled_idx = np.random.choice(np.min([self.memory_counter, self.memory_size]), size=self.state_samples, replace=False)
-
-#             print(self.state_mem)
-#             print(idx)
-#             sampled_states = self.state_mem[idx]
-
-        sampled_obs = self.obs_mem[sampled_idx,:]
-
-#             sampled_obs = []
-
-        targets = [None for i in range(self.num_nets)]
-
-        for index in sampled_idx:
-            s_state = self.state_mem[index]
-            o = self.state_mem[index]
-#             for s_state, o in zip(sampled_states, sampled_obs):
+        for _ in range(self.gradient_steps):
+            sampled_idx = np.random.choice(np.min([self.memory_counter, self.memory_size]), size=self.state_samples, replace=False)
+            
+            sampled_obs = self.obs_mem[sampled_idx,:]
+            sampled_targets = self.targets_mem[sampled_idx,:]
+            sampled_targets = sampled_targets.transpose()
+            
+            for i in range(self.num_nets):
+                net = self.value_nets[i]
+                loss_func = self.loss_funcs[i]
+                optimizer = self.optimizers[i]
+                
+                optimizer.zero_grad()
+                
+#                 print("Target: {}".format(sampled_targets[i]))
+                preds = net(torch.tensor(sampled_obs, dtype=torch.float))
+                
+                target = torch.tensor([sampled_targets[i]], dtype=torch.float)
+                loss = loss_func(preds, target)
             
 
-            max_rewards = [float('-inf') for _ in range(self.num_nets)]
-
-            for k in range(self.K):
-#                     print(len(self.x_init), self.x_init)
-#                     print(len(s_state), s_state)
-                self.env.sim.set_state(s_state)
-                discount = 1
-                total_reward = 0
-                for t in range(self.T):
-                    perturbed_action_t = self.U[t] + self.noise[k, t]
-
-                    s, reward, _, _ = env.step(np.array([perturbed_action_t]))
-
-                    total_reward += discount * reward
-                    discount *= self.gamma
-
-                for i in range(self.num_nets):
-                    net = self.value_nets[i]
-                    reward_for_net = torch.tensor(total_reward, dtype=torch.float) + net(torch.tensor(s[:22], dtype=torch.float))
-                    if reward_for_net > max_rewards[i]:
-                        max_rewards[i] = reward_for_net
-
-
-
-            for i in range(self.num_nets):
-                target = max_rewards[i]
-
-                if targets[i] is None:
-                    targets[i] = torch.tensor([[target]], dtype=torch.float)
-                else:
-                    targets[i] = torch.cat((targets[i], torch.tensor([[target]], dtype=torch.float)))
-
+                loss.backward()
+                optimizer.step()
+                
+                
+#             print("=====")
+#             print(sampled_obs)
+#             print(sampled_targets)
+        return
+        self.x_init = self.env.sim.get_state()
         
         for _ in range(self.gradient_steps):
+            sampled_idx = np.random.choice(np.min([self.memory_counter, self.memory_size]), size=self.state_samples, replace=False)
+
+    #             print(self.state_mem)
+    #             print(idx)
+    #             sampled_states = self.state_mem[idx]
+
+            sampled_obs = self.obs_mem[sampled_idx,:]
+
+    #             sampled_obs = []
+
+            targets = [None for i in range(self.num_nets)]
+
+            for index in sampled_idx:
+                s_state = self.state_mem[index]
+                o = self.state_mem[index]
+    #             for s_state, o in zip(sampled_states, sampled_obs):
+
+
+                max_rewards = [float('-inf') for _ in range(self.num_nets)]
+
+                for k in range(self.K):
+    #                     print(len(self.x_init), self.x_init)
+    #                     print(len(s_state), s_state)
+                    self.env.sim.set_state(s_state)
+                    discount = 1
+                    total_reward = 0
+                    for t in range(self.T):
+                        perturbed_action_t = self.U[t] + self.noise[k, t]
+
+                        s, reward, _, _ = env.step(np.array([perturbed_action_t]))
+
+                        total_reward += discount * reward
+                        discount *= self.gamma
+
+                    for i in range(self.num_nets):
+                        net = self.value_nets[i]
+                        reward_for_net = torch.tensor(total_reward, dtype=torch.float) + net(torch.tensor(s[:22], dtype=torch.float))
+                        if reward_for_net > max_rewards[i]:
+                            max_rewards[i] = reward_for_net
+
+
+
+                for i in range(self.num_nets):
+                    target = max_rewards[i]
+
+                    if targets[i] is None:
+                        targets[i] = torch.tensor([[target]], dtype=torch.float)
+                    else:
+                        targets[i] = torch.cat((targets[i], torch.tensor([[target]], dtype=torch.float)))
+
+        
+#         for _ in range(self.gradient_steps):
             for i in range(self.num_nets):
                 net = self.value_nets[i]
                 loss_func = self.loss_funcs[i]
@@ -190,7 +266,20 @@ class POLO(object):
                 
         self.env.sim.set_state(self.x_init)
         
-
+    def get_aggregated_value(self, values):
+        weights = softmax(0.01 * values)
+        weighted_values = values * weights
+        
+        return sum(weighted_values)
+    
+    def get_network_values(self, s):
+        values = []
+        for net in self.value_nets:
+            values.append(net(torch.FloatTensor(s)).tolist())
+            
+        values = np.array(values)
+        return values
+    
     def _compute_total_reward(self, k):
         discount = 1
         ############################
@@ -207,13 +296,21 @@ class POLO(object):
             self.reward_total[k] += discount * reward
             discount *= self.gamma
         
-        self.reward_total[k] += discount * self.get_aggregated_value(s[:22])
+        network_values = self.get_network_values(s[:22])
+        
+        for i in range(self.num_nets):
+            reward_for_net = self.reward_total[k] + discount * network_values[i]
+            if reward_for_net > self.max_reward_for_net[i]:
+                self.max_reward_for_net[i] = reward_for_net
+        
+        self.reward_total[k] += discount * self.get_aggregated_value(network_values)
 
     def _ensure_non_zero(self, reward, beta, factor):
         return np.exp(-factor * (beta - reward))
 
 
-    def choose_action(self, env):
+    def get_action_and_targets(self, env):
+        self.max_reward_for_net = np.full((self.num_nets), '-inf', dtype=np.float)
         if self.env.unwrapped.spec.id == "Pendulum-v0":
             self.x_init = self.env.env.state
         elif self.env.unwrapped.spec.id == "HumanoidStandup-v2":
@@ -225,6 +322,7 @@ class POLO(object):
                 self.env.env.state = self.x_init
             elif self.env.unwrapped.spec.id == "HumanoidStandup-v2":
                 self.env.sim.set_state(self.x_init)
+        print(self.max_reward_for_net)
             
         beta = np.max(self.reward_total)  # maximum reward of all trajectories
         reward_total_non_zero = self._ensure_non_zero(reward=self.reward_total, beta=beta, factor=1/self.lambda_)
@@ -244,7 +342,9 @@ class POLO(object):
         
         self.noise = np.random.normal(loc=self.noise_mu, scale=self.noise_sigma, size=(self.K, self.T, self.env.action_space.shape[0]))
         
-        return action
+        
+        
+        return action, self.max_reward_for_net
     
     def control(self, iter=1000):
         for timestamp in range(iter):
@@ -280,7 +380,8 @@ class POLO(object):
             if self.env.unwrapped.spec.id == "HumanoidStandup-v2":
                 r = self._get_reward_from_state(s)
             print("timestamp: {}, action taken: {} reward received: {}".format(timestamp, self.U[0], r))
-            self.env.render()
+            if RENDER:
+                self.env.render()
 #             self.env.sim.render(1024, 1024)
 
             self.U = np.roll(self.U, -1, axis=0)
@@ -302,13 +403,13 @@ class POLO(object):
             
             self.noise = np.random.normal(loc=self.noise_mu, scale=self.noise_sigma, size=(self.K, self.T, self.env.action_space.shape[0]))
     
-    def _write_record(self, timestamp, reward, action, state):
+    def write_record(self, timestamp, reward, action, state):
         action_json = json.dumps(action.tolist())
         state_json = json.dumps(state.reshape(len(state), 1).tolist())
         self.writer.writerow([timestamp, reward, action_json, state_json])
         self.log_file.flush()
         
-    def store_state(self, obs, state):
+    def store_state(self, obs, state, rewards):
         if not hasattr(self, 'memory_counter'):
             self.memory_counter = 0
 
@@ -316,73 +417,86 @@ class POLO(object):
         index = self.memory_counter % self.memory_size
         self.obs_mem[index] = np.array(obs)
         self.state_mem[index] = state
+        self.targets_mem[index] = rewards
 
         self.memory_counter += 1
+
+
+# In[7]:
+
+
+num_epos = 1000
+for idx in range(num_epos):
+    print("Running for episode {}...".format(idx))
+    ENV_NAME = "HumanoidStandup-v2"
+    TIMESTEPS = 64  # T
+    N_SAMPLES = 128  # K
+    ACTION_LOW = -1.0
+    ACTION_HIGH = 1.0
+
+    # TIMESTEPS = 15 # T
+    # N_SAMPLES = 120  # K
+
+    STATE_SAMPLES = 32
+
+    noise_mu = 0
+    noise_sigma = 0.2
+    lambda_ = 1.25
+    gamma = 0.99
+
+    Z = 16
+
+    env = gym.make(ENV_NAME)
+
+    # from gym.wrappers import Monitor
+    # env = Monitor(env, './video', force=True)
+    # env._max_episode_steps = 200
+    # env.render()
+    # env.sim.render(1024, 1024)
+    print(env.observation_space)
+    print(env.action_space)
+
+    U = np.random.uniform(low=ACTION_LOW, high=ACTION_HIGH, size=(TIMESTEPS, env.action_space.shape[0]))  # pendulum joint effort in (-2, +2)
+    # print(U)
+
+    log_file = open("polo_record_multiple_{}.tsv".format(idx), "w")
+
+    s = env.reset()
+
+    polo = POLO(env=env, K=N_SAMPLES, T=TIMESTEPS, U=U, lambda_=lambda_, noise_mu=noise_mu, 
+                    noise_sigma=noise_sigma, u_init=0, memory_size=512, 
+                    observation_space=22, action_space=env.action_space.shape[0],
+                    state_space=env.observation_space.shape[0], net_hidden_layers=16, 
+                    num_nets=6, state_samples=STATE_SAMPLES, gradient_steps=64, 
+                    gamma=gamma, log_file=log_file, noise_gaussian=True)
+
+
+    # polo.store_state(s[:22], env.sim.get_state())
+
+    rewards = []
+    for t in range(3000):
+        a, targets = polo.get_action_and_targets(env)
+        polo.store_state(s[:22], env.sim.get_state(), targets)
+        s, r, _, _ = env.step(np.array([a]))
+        rewards.append(r)
+        polo.write_record(t, s[0], a, s[:22])
+        print("episode: {}, timestamp: {}, action taken: {} reward received: {}".format(idx, t, a, s[0]))
+        if RENDER:
+            env.render()
+
+
+        if t != 0 and t % Z == 0 and t >= STATE_SAMPLES:
+            print("Updating networks...")
+            polo.learn(env)
+
+
+    # mppi_gym.control(iter=30)
+
+    log_file.close()
 
 
 # In[ ]:
 
 
-ENV_NAME = "HumanoidStandup-v2"
-TIMESTEPS = 64  # T
-N_SAMPLES = 128  # K
-ACTION_LOW = -1.0
-ACTION_HIGH = 1.0
 
-# TIMESTEPS = 15 # T
-# N_SAMPLES = 120  # K
-
-STATE_SAMPLES = 32
-
-noise_mu = 0
-noise_sigma = 0.2
-lambda_ = 1.25
-gamma = 0.99
-
-Z = 16
-
-env = gym.make(ENV_NAME)
-
-# from gym.wrappers import Monitor
-# env = Monitor(env, './video', force=True)
-# env._max_episode_steps = 200
-# env.render()
-# env.sim.render(1024, 1024)
-print(env.observation_space)
-print(env.action_space)
-
-U = np.random.uniform(low=ACTION_LOW, high=ACTION_HIGH, size=(TIMESTEPS, env.action_space.shape[0]))  # pendulum joint effort in (-2, +2)
-# print(U)
-
-log_file = open("polo_record_tmp.tsv", "w")
-
-s = env.reset()
-
-polo = POLO(env=env, K=N_SAMPLES, T=TIMESTEPS, U=U, lambda_=lambda_, noise_mu=noise_mu, 
-                noise_sigma=noise_sigma, u_init=0, memory_size=512, 
-                observation_space=22, action_space=env.action_space.shape[0],
-                state_space=env.observation_space.shape[0], net_hidden_layers=16, 
-                num_nets=6, state_samples=STATE_SAMPLES, gradient_steps=64, 
-                gamma=gamma, log_file=log_file, noise_gaussian=True)
-
-
-polo.store_state(s[:22], env.sim.get_state())
-
-rewards = []
-for t in range(10000):
-    a = polo.choose_action(env)
-    s, r, _, _ = env.step(np.array([a]))
-    rewards.append(r)
-    print("timestamp: {}, action taken: {} reward received: {}".format(t, a, s[0]))
-    env.render()
-    polo.store_state(s[:22], env.sim.get_state())
-    
-    if t != 0 and t % Z == 0 and t >= STATE_SAMPLES:
-        print("Updating networks...")
-        polo.learn(env)
-
-
-# mppi_gym.control(iter=30)
-
-log_file.close()
 
